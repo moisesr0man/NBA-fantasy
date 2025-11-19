@@ -12,9 +12,20 @@ st.set_page_config(page_title="NBA ", page_icon="🏀")
 @st.cache_resource
 def conectar_sheets():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-    client = gspread.authorize(creds)
+
+    # Intenta buscar en los Secretos de Streamlit (Nube)
+    if "gcp_service_account" in st.secrets:
+        creds_dict = st.secrets["gcp_service_account"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     
+    # Si no encuentra secretos, busca el archivo local (Tu PC)
+    else:
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        
+    client = gspread.authorize(creds)
+    # Asegúrate que este nombre sea EXACTO al de tu hoja
+    sheet = client.open("FANTASEX NBA").worksheet("votos")
+    return sheet    
     # --- ¡OJO! CAMBIA ESTO POR EL NOMBRE DE TU ARCHIVO ---
     sheet = client.open("FANTASEX NBA").worksheet("votos")
     return sheet
@@ -126,4 +137,5 @@ with tab2:
                 
                 if not ranking.empty:
                     lider = ranking.iloc[0]
+
                     st.metric("👑 Líder", lider['usuario'], f"{lider['acierto']} Puntos")

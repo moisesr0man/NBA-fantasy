@@ -4,6 +4,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from nba_api.live.nba.endpoints import scoreboard
 from datetime import datetime
+from nba_api.stats.endpoints import scoreboardv2
+from nba_api.stats.static import teams
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="NBA ", page_icon="🏀")
@@ -127,90 +129,111 @@ with tab1:
                     st.form_submit_button("Actualizar", disabled=True)
 # --- LÓGICA PESTAÑA 2: RESULTADOS ---
 
+# --- REEMPLAZA TU SECCIÓN "with tab2:" COMPLETA CON ESTO ---
+
 with tab2:
     st.header("Ranking Global")
     
     if st.button("🔄 Calcular Puntajes Actuales"):
-        with st.spinner("Consultando resultados finales a la NBA..."):
+        with st.spinner("Consultando la base de datos histórica de la NBA..."):
             
-            # --- CAMBIO CLAVE: Usamos get_all_values en lugar de get_all_records ---
-            # Esto trae TODO como una matriz simple, mucho más seguro.
+            # 1. Preparamos el "Traductor" de equipos (ID -> Nombre corto)
+            # Esto es necesario porque la API de stats usa IDs (1610612747) y tú guardaste nombres ("Lakers")
+            nba_teams = teams.get_teams()
+            team_map = {str(t['id']): t['nickname'] for t in nba_teams} # Ejemplo: {'1610612...': 'Lakers'}
+            
+            # 2. Bajamos los votos de tu Google Sheet
             todos_los_datos = hoja_votos.get_all_values()
             
-            # Verificamos si hay suficientes datos (Mínimo debe haber encabezados + 1 voto)
             if len(todos_los_datos) < 2:
-                st.warning("⚠️ Tu hoja de cálculo parece vacía (solo tiene encabezados o nada). ¡Vota primero!")
-                # DEBUG: Mostramos qué ve Python
-                st.write("Lo que veo en tu hoja es:", todos_los_datos)
-            
+                st.warning("⚠️ No hay suficientes datos para calcular. ¡Vota primero!")
             else:
-                # Construimos el DataFrame manualmente para asegurar que las columnas se llamen bien
-                encabezados = todos_los_datos[0]  # La primera fila son los títulos
-                filas = todos_los_datos[1:]       # El resto son datos
-                
+                # Creamos el DataFrame
+                encabezados = todos_los_datos[0]
+                filas = todos_los_datos[1:]
                 df = pd.DataFrame(filas, columns=encabezados)
                 
-                # --- LIMPIEZA DE COLUMNAS (Por si pusiste "Fecha " con espacio o "FECHA") ---
+                # Limpiamos nombres de columnas
                 df.columns = df.columns.str.strip().str.lower()
                 
-                # DEBUG: Si falla, esto nos dirá qué columnas detectó realmente
+                # Verificamos fechas únicas
                 if 'fecha' not in df.columns:
-                    st.error("🚨 Error Crítico: No encuentro la columna 'fecha'.")
-                    st.write("Las columnas que detecté son:", df.columns.tolist())
+                    st.error("Error: No encuentro la columna 'fecha' en tu Excel.")
                     st.stop()
 
-                fechas = df['fecha'].unique()
-                ganadores_reales = {}
+                fechas_unicas = df['fecha'].unique()
+                ganadores_reales = {} # {game_id: 'Lakers'}
                 
                 # Barra de progreso
                 bar = st.progress(0)
-                for i, f in enumerate(fechas):
-                    # Saltamos filas vacías si las hubiera
-                    if not f: continue 
+                
+                # 3. Loop para consultar cada fecha en la API de ESTADÍSTICAS
+                for i, fecha_str in enumerate(fechas_unicas):
+                    if not fecha_str: continue
                     
                     try:
-                        sb = scoreboard.ScoreBoard(game_date=f)
-                        for g in sb.games.get_dict():
-                            if "Final" in g['gameStatusText']:
-                                h_s = g['homeTeam']['score']
-                                a_s = g['awayTeam']['score']
-                                win = g['homeTeam']['teamName'] if h_s > a_s else g['awayTeam']['teamName']
-                                # Convertimos gameId a string para asegurar compatibilidad
-                                ganadores_reales[str(g['gameId'])] = win
+                        # Usamos ScoreboardV2 que SÍ acepta fechas pasadas
+                        # header=... es para evitar bloqueos de la API
+                        sb = scoreboardv2.ScoreboardV2(game_date=fecha_str, timeout=30)
+                        
+                        # Obtenemos los puntajes línea por línea
+                        line_score = sb.line_score.get_data_frame()
+                        
+                        if not line_score.empty:
+                            # La API devuelve una fila por equipo. Agrupamos por GAME_ID para ver quién ganó.
+                            # Columnas clave: GAME_ID, TEAM_ID, PTS
+                            
+                            # Lista de Game IDs en ese día
+                            games_ids = line_score['GAME_ID'].unique()
+                            
+                            for gid in games_ids:
+                                # Filtramos los 2 equipos de ese juego
+                                juego = line_score[line_score['GAME_ID'] == gid]
+                                # Buscamos el que tenga más puntos (max PTS)
+                                ganador = juego.loc[juego['PTS'].idxmax()]
+                                
+                                # Traducimos ID del ganador a Nombre (ej: 1610612747 -> Lakers)
+                                team_id_str = str(ganador['TEAM_ID'])
+                                if team_id_str in team_map:
+                                    nombre_ganador = team_map[team_id_str]
+                                    ganadores_reales[str(gid)] = nombre_ganador
+                                    
                     except Exception as e:
-                        st.warning(f"Error consultando fecha {f}: {e}")
+                        print(f"Error procesando fecha {fecha_str}: {e}")
                     
-                    bar.progress((i+1)/len(fechas))
+                    bar.progress((i + 1) / len(fechas_unicas))
                 
-                # Calcular aciertos
+                # 4. Comparación Final
                 if not ganadores_reales:
-                    st.info("No encontré partidos terminados ('Final') en esas fechas para comparar.")
+                    st.info("No encontré resultados oficiales para las fechas de tus votos. ¿Quizás los partidos no han terminado?")
                 else:
-                    # Función de comparación segura
                     def verificar_ganador(row):
                         gid = str(row.get('game_id', '')).strip()
                         voto = str(row.get('ganador_elegido', '')).strip()
                         
-                        if gid in ganadores_reales and ganadores_reales[gid] == voto:
-                            return 1
+                        # Comparamos si el ID del juego existe y si el nombre coincide
+                        if gid in ganadores_reales:
+                            real = ganadores_reales[gid]
+                            if real == voto:
+                                return 1
                         return 0
 
                     df['acierto'] = df.apply(verificar_ganador, axis=1)
                     
+                    # Tabla de posiciones
                     ranking = df.groupby('usuario')['acierto'].sum().reset_index().sort_values('acierto', ascending=False)
                     
-                    st.success("¡Tabla actualizada!")
-                    
+                    st.success("¡Cálculo completado exitosamente!")
                     st.dataframe(
                         ranking, 
                         use_container_width=True, 
                         hide_index=True,
                         column_config={
                             "usuario": "Jugador",
-                            "acierto": st.column_config.NumberColumn("Puntos Totales", format="%d 🎯")
+                            "acierto": st.column_config.NumberColumn("Aciertos", format="%d 🎯")
                         }
                     )
                     
                     if not ranking.empty:
                         lider = ranking.iloc[0]
-                        st.metric("👑 Líder", lider['usuario'], f"{lider['acierto']} Puntos")
+                        st.metric("👑 Ganador Actual", lider['usuario'], f"{lider['acierto']} Puntos")
